@@ -42,7 +42,7 @@ jobs:
 
     - name: Clone OpenWrt main
       run: |
-        git clone https://github.com/openwrt/openwrt -b main openwrt
+        git clone https://github.com/openwrt/openwrt -b openwrt-25.12 openwrt
 
     - name: Load custom feeds and config
       run: |
