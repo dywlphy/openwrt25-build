@@ -1,0 +1,251 @@
+# ============================================================
+# OpenWrt 25 稳定版编译
+# 核心：CUPS + SSR-Plus + ksmbd
+# ============================================================
+
+name: Build OpenWrt 25
+
+on:
+  workflow_dispatch:
+
+env:
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev python3 python3-pip python3-ply python3-setuptools rsync swig unzip zlib1g-dev file wget cpio rsync unzip file libelf-dev libfuse-dev libpam0g-dev libzstd-dev cups libcups2-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone Asia/Shanghai
+
+    - name: Clone OpenWrt main
+      run: |
+        git clone https://github.com/openwrt/openwrt -b main openwrt
+
+    - name: Load custom feeds and config
+      run: |
+        cp config.txt openwrt/.config
+        cp diy-part1.sh openwrt/
+        cp diy-part2.sh openwrt/
+        chmod +x openwrt/diy-part1.sh openwrt/diy-part2.sh
+        cd openwrt
+        ./diy-part1.sh
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Run diy-part2.sh (after feeds ready)
+      run: |
+        cd openwrt
+        ./diy-part2.sh
+
+    - name: Remove conflicting packages
+      run: |
+        cd openwrt
+        rm -rf feeds/smpackage/{base-files,dnsmasq,firewall*,fullconenat,libnftnl,nftables,ppp,opkg,ucl,upx,vsftpd*,miniupnpd-iptables,wireless-regdb} 2>/dev/null || true
+        rm -rf feeds/packages/net/onionshare-cli 2>/dev/null || true
+        find . -name "onionshare-cli" -type d -exec rm -rf {} \; 2>/dev/null || true
+        for idx in feeds/*.index; do
+          [ -f "$idx" ] && sed -i '/onionshare-cli/d' "$idx" || true
+        done
+        rm -rf tmp/
+        echo "✅ 冲突包已清除"
+
+    - name: Run make defconfig
+      run: |
+        cd openwrt
+        make defconfig
+
+    - name: Force enable key packages
+      run: |
+        cd openwrt
+        
+        enable_pkg() {
+          local pattern="$1"
+          if grep -q "^# CONFIG_PACKAGE_${pattern} is not set" .config; then
+            sed -i "s/^# CONFIG_PACKAGE_${pattern} is not set/CONFIG_PACKAGE_${pattern}=y/" .config
+            echo "  强制启用: $pattern"
+          elif grep -q "^CONFIG_PACKAGE_${pattern}=y" .config; then
+            echo "  已启用: $pattern"
+          else
+            echo "CONFIG_PACKAGE_${pattern}=y" >> .config
+            echo "  追加启用: $pattern"
+          fi
+        }
+        
+        echo "【强制启用核心包】"
+        enable_pkg "cups"
+        enable_pkg "cups-filters"
+        enable_pkg "cups-bjnp"
+        enable_pkg "ghostscript"
+        enable_pkg "gutenprint"
+        enable_pkg "foomatic-db"
+        enable_pkg "foomatic-db-engine"
+        enable_pkg "avahi-daemon"
+        enable_pkg "dbus"
+        enable_pkg "luci-app-cupsd"
+        enable_pkg "ksmbd-server"
+        enable_pkg "luci-app-ksmbd"
+        enable_pkg "luci-app-ssr-plus"
+        enable_pkg "luci-app-sqm"
+        enable_pkg "luci-app-upnp"
+        enable_pkg "luci-app-ddns"
+        enable_pkg "luci-app-wol"
+        enable_pkg "luci-proto-wireguard"
+        enable_pkg "vlmcsd"
+        enable_pkg "luci-app-vlmcsd"
+        enable_pkg "curl"
+        enable_pkg "luci-theme-bootstrap"
+
+        # 强制禁用 mosdns（Go 版本不兼容）
+        sed -i 's/^CONFIG_PACKAGE_mosdns=y/# CONFIG_PACKAGE_mosdns is not set/' .config
+        sed -i 's/^CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_MosDNS=y/# CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_MosDNS is not set/' .config
+        echo "  已禁用 mosdns（Go 版本不兼容）"
+
+        # 设置 GRUB 最小超时 1 秒
+        echo "CONFIG_GRUB_TIMEOUT_MINIMUM=1" >> .config
+        echo "  已设置 GRUB 超时最小值 = 1 秒"
+
+        echo "==========================="
+
+        echo ""
+        echo "重新运行 make defconfig..."
+        make defconfig
+
+    - name: Verify package requirements
+      run: |
+        cd openwrt
+        
+        echo ""
+        echo "╔══════════════════════════════════════╗"
+        echo "║  🔍 第一道检查：依赖链完整性         ║"
+        echo "╚══════════════════════════════════════╝"
+        echo ""
+        
+        TOTAL=$(grep -c "^CONFIG_PACKAGE_.*=y" .config)
+        echo "  已解析的包总数: $TOTAL"
+        echo ""
+        
+        if [ "$TOTAL" -lt 50 ]; then
+          echo "❌ 已解析的包少于 50 个，依赖解析可能失败"
+        fi
+        
+        FAIL=0
+        check_config() {
+          local name="$1"
+          local desc="${2:-}"
+          if grep -q "^CONFIG_PACKAGE_${name}=y" .config 2>/dev/null; then
+            echo "  ✅ $name ${desc:+($desc)}"
+            return 0
+          fi
+          local alt=$(echo "$name" | sed 's/-/_/g')
+          if grep -q "^CONFIG_PACKAGE_${alt}=y" .config 2>/dev/null; then
+            echo "  ⚠️  $name → 实际包名: $alt ${desc:+($desc)}"
+            return 0
+          fi
+          echo "  ❌ $name ${desc:+($desc)} - defconfig 后未解析到此包！"
+          FAIL=1
+          return 0
+        }
+        
+        echo "【核心功能包依赖解析检查】"
+        check_config "uhttpd" "Web管理界面"
+        check_config "dropbear" "SSH服务"
+        check_config "cups" "CUPS核心"
+        check_config "cups-filters" "打印过滤器"
+        check_config "ksmbd-server" "SMB共享服务"
+        check_config "luci-app-ksmbd" "ksmbd管理界面"
+        check_config "luci-app-ssr-plus" "SSR-Plus"
+        check_config "luci-app-sqm" "SQM QoS"
+        check_config "luci-app-upnp" "UPnP"
+        check_config "luci-app-ddns" "动态DNS"
+        check_config "luci-app-wol" "网络唤醒"
+        check_config "wireguard-tools" "WireGuard"
+        check_config "luci-proto-wireguard" "WireGuard界面"
+        echo ""
+        
+        if [ "$FAIL" -eq 1 ]; then
+          echo "╔══════════════════════════════════════╗"
+          echo "║  ❌ 第一道检查失败                   ║"
+          echo "║  核心包未被 defconfig 解析           ║"
+          echo "╚══════════════════════════════════════╝"
+          exit 1
+        else
+          echo "╔══════════════════════════════════════╗"
+          echo "║  ✅ 第一道检查通过                   ║"
+          echo "║  解析包总数: $TOTAL                  ║"
+          echo "╚══════════════════════════════════════╝"
+        fi
+
+    - name: Download packages
+      run: cd openwrt && make download -j8 || make download -j1 V=s
+
+    - name: Compile firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j8 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to Artifacts
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_25_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=25-$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to Release
+      uses: softprops/action-gh-release@master
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      with:
+        token: ${{ secrets.RELEASES_TOKEN }}
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
