@@ -1,0 +1,322 @@
+# ============================================================
+# OpenWrt 25 稳定版编译
+# 核心：CUPS + SSR-Plus + ksmbd
+# 
+# 修复记录：
+# - 2026-05-07：添加完整 LuCI 核心依赖（修复界面报错）
+# - 2026-05-07：修复 GRUB 超时配置为 0 秒
+# - 2026-05-07：添加 openwrt-cups 源（ghostscript, gutenprint, foomatic）
+# - 2026-05-07：添加 immortalwrt 源
+# ============================================================
+
+name: Build OpenWrt 25
+
+on:
+  workflow_dispatch:
+
+env:
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev python3 python3-pip python3-ply python3-setuptools rsync swig unzip zlib1g-dev file wget cpio rsync unzip file libelf-dev libfuse-dev libpam0g-dev libzstd-dev cups libcups2-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone Asia/Shanghai
+
+    - name: Clone OpenWrt main
+      run: |
+        git clone https://github.com/openwrt/openwrt -b main openwrt
+
+    - name: Load custom feeds and config
+      run: |
+        [ -f config.txt ] && cp config.txt openwrt/.config
+        [ -f diy-part1.sh ] && cp diy-part1.sh openwrt/
+        [ -f diy-part2.sh ] && cp diy-part2.sh openwrt/
+        chmod +x openwrt/diy-part1.sh openwrt/diy-part2.sh 2>/dev/null || true
+        cd openwrt
+        ./diy-part1.sh
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Run diy-part2.sh (after feeds ready)
+      run: |
+        cd openwrt
+        ./diy-part2.sh
+
+    - name: Remove conflicting packages
+      run: |
+        cd openwrt
+        rm -rf feeds/smpackage/{base-files,dnsmasq,firewall*,fullconenat,libnftnl,nftables,ppp,opkg,ucl,upx,vsftpd*,miniupnpd-iptables,wireless-regdb} 2>/dev/null || true
+        rm -rf feeds/packages/net/onionshare-cli 2>/dev/null || true
+        find . -name "onionshare-cli" -type d -exec rm -rf {} \; 2>/dev/null || true
+        for idx in feeds/*.index; do
+          [ -f "$idx" ] && sed -i '/onionshare-cli/d' "$idx" || true
+        done
+        rm -rf tmp/
+        echo "✅ 冲突包已清除"
+
+    - name: Run make defconfig
+      run: |
+        cd openwrt
+        make defconfig
+
+    - name: Force enable key packages
+      run: |
+        cd openwrt
+        
+        enable_pkg() {
+          local pattern="$1"
+          if grep -q "^# CONFIG_PACKAGE_${pattern} is not set" .config; then
+            sed -i "s/^# CONFIG_PACKAGE_${pattern} is not set/CONFIG_PACKAGE_${pattern}=y/" .config
+            echo "  强制启用: $pattern"
+          elif grep -q "^CONFIG_PACKAGE_${pattern}=y" .config; then
+            echo "  已启用: $pattern"
+          else
+            echo "CONFIG_PACKAGE_${pattern}=y" >> .config
+            echo "  追加启用: $pattern"
+          fi
+        }
+        
+        # ==========================================
+        # 关键修复：LuCI 核心依赖（修复界面报错）
+        # ==========================================
+        echo "【强制启用 LuCI 核心依赖】"
+        enable_pkg "luci-base"
+        enable_pkg "luci-mod-admin-full"
+        enable_pkg "luci-mod-network"
+        enable_pkg "luci-mod-status"
+        enable_pkg "luci-mod-system"
+        enable_pkg "rpcd"
+        enable_pkg "rpcd-mod-file"
+        enable_pkg "rpcd-mod-iwinfo"
+        enable_pkg "rpcd-mod-rpcsys"
+        enable_pkg "rpcd-mod-rrdns"
+        enable_pkg "uhttpd"
+        enable_pkg "uhttpd-mod-ubus"
+        enable_pkg "cgi-io"
+        enable_pkg "ucode"
+        enable_pkg "ucode-mod-fs"
+        enable_pkg "ucode-mod-math"
+        enable_pkg "ucode-mod-nl80211"
+        enable_pkg "ucode-mod-resolv"
+        enable_pkg "ucode-mod-ubus"
+        enable_pkg "ucode-mod-uci"
+        enable_pkg "luci-theme-bootstrap"
+        
+        echo ""
+        echo "【强制启用核心功能包】"
+        enable_pkg "cups"
+        enable_pkg "cups-filters"
+        enable_pkg "cups-bjnp"
+        enable_pkg "avahi-dbus-daemon"
+        enable_pkg "dbus"
+        enable_pkg "luci-app-cupsd"
+        enable_pkg "ksmbd-server"
+        enable_pkg "luci-app-ksmbd"
+        enable_pkg "luci-app-ssr-plus"
+        enable_pkg "luci-app-sqm"
+        enable_pkg "luci-app-upnp"
+        enable_pkg "luci-app-ddns"
+        enable_pkg "luci-app-wol"
+        enable_pkg "luci-proto-wireguard"
+        enable_pkg "vlmcsd"
+        enable_pkg "luci-app-vlmcsd"
+        enable_pkg "curl"
+        
+        # 从 openwrt-cups 源启用打印驱动包
+        enable_pkg "ghostscript"
+        enable_pkg "gutenprint"
+        enable_pkg "foomatic-db"
+        enable_pkg "foomatic-db-engine"
+
+        # 强制禁用 mosdns（Go 版本不兼容）
+        sed -i 's/^CONFIG_PACKAGE_mosdns=y/# CONFIG_PACKAGE_mosdns is not set/' .config
+        sed -i 's/^CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_MosDNS=y/# CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_MosDNS is not set/' .config
+        echo "  已禁用 mosdns（Go 版本不兼容）"
+
+        # 设置 GRUB 超时 0 秒
+        sed -i 's/CONFIG_GRUB_TIMEOUT=.*/CONFIG_GRUB_TIMEOUT=0/' .config
+        echo "CONFIG_GRUB_TIMEOUT=0" >> .config
+        echo "  已设置 GRUB 超时 = 0 秒"
+
+        echo "==========================="
+        
+        echo ""
+        echo "重新运行 make defconfig..."
+        make defconfig
+
+    - name: Verify package requirements
+      run: |
+        cd openwrt
+        
+        echo ""
+        echo "╔══════════════════════════════════════╗"
+        echo "║  🔍 第一道检查：依赖链完整性         ║"
+        echo "╚══════════════════════════════════════╝"
+        echo ""
+        
+        TOTAL=$(grep -c "^CONFIG_PACKAGE_.*=y" .config)
+        echo "  已解析的包总数: $TOTAL"
+        echo ""
+        
+        if [ "$TOTAL" -lt 50 ]; then
+          echo "❌ 已解析的包少于 50 个，依赖解析可能失败"
+        fi
+        
+        FAIL=0
+        
+        check_config() {
+          local name="$1"
+          local desc="${2:-}"
+          local required="${3:-yes}"
+          if grep -q "^CONFIG_PACKAGE_${name}=y" .config 2>/dev/null; then
+            echo "  ✅ $name ${desc:+($desc)}"
+            return 0
+          fi
+          local alt=$(echo "$name" | sed 's/-/_/g')
+          if grep -q "^CONFIG_PACKAGE_${alt}=y" .config 2>/dev/null; then
+            echo "  ⚠️  $name → 实际包名: $alt ${desc:+($desc)}"
+            return 0
+          fi
+          if [ "$required" = "yes" ]; then
+            echo "  ❌ $name ${desc:+($desc)} - 编译将缺失此功能！"
+            FAIL=1
+          else
+            echo "  ⚠️  $name ${desc:+($desc)} - 已跳过（当前源不提供）"
+          fi
+          return 0
+        }
+        
+        echo "【LuCI 核心 - 修复界面报错】"
+        check_config "luci-base" "LuCI基础"
+        check_config "luci-mod-admin-full" "管理界面"
+        check_config "rpcd" "RPC守护进程"
+        check_config "rpcd-mod-file" "文件RPC"
+        check_config "rpcd-mod-iwinfo" "无线信息RPC"
+        check_config "uhttpd" "Web服务器"
+        check_config "uhttpd-mod-ubus" "uhttpd ubus模块"
+        check_config "cgi-io" "CGI接口"
+        check_config "ucode" "ucode解释器"
+        check_config "ucode-mod-ubus" "ucode ubus模块"
+        check_config "ucode-mod-uci" "ucode uci模块"
+        check_config "luci-theme-bootstrap" "默认主题"
+        echo ""
+        echo "【CUPS 打印 - 核心】"
+        check_config "cups" "CUPS核心"
+        check_config "cups-filters" "打印过滤器"
+        check_config "luci-app-cupsd" "CUPS管理界面"
+        echo "【CUPS 打印 - 驱动与扩展】"
+        check_config "cups-bjnp" "Canon网络发现"
+        check_config "ghostscript" "PostScript解释器" "optional"
+        check_config "gutenprint" "打印机驱动包" "optional"
+        check_config "foomatic-db" "打印机数据库" "optional"
+        check_config "foomatic-db-engine" "打印引擎" "optional"
+        check_config "avahi-dbus-daemon" "mDNS网络发现" "optional"
+        check_config "dbus" "D-Bus总线"
+        echo ""
+        echo "【文件共享】"
+        check_config "ksmbd-server" "SMB共享服务"
+        check_config "luci-app-ksmbd" "ksmbd管理界面"
+        echo ""
+        echo "【科学上网】"
+        check_config "luci-app-ssr-plus" "SSR-Plus"
+        echo ""
+        echo "【实用工具】"
+        check_config "luci-app-sqm" "SQM QoS"
+        check_config "luci-app-upnp" "UPnP"
+        check_config "luci-app-ddns" "动态DNS"
+        check_config "luci-app-wol" "网络唤醒"
+        check_config "wireguard-tools" "WireGuard"
+        check_config "luci-proto-wireguard" "WireGuard界面"
+        check_config "vlmcsd" "KMS激活服务"
+        check_config "luci-app-vlmcsd" "KMS管理界面"
+        echo ""
+        
+        if [ "$FAIL" -eq 1 ]; then
+          echo "╔══════════════════════════════════════╗"
+          echo "║  ❌ 第一道检查失败                   ║"
+          echo "║  以上必选包编译后将缺失             ║"
+          echo "║  已终止编译，请检查源和依赖         ║"
+          echo "╚══════════════════════════════════════╝"
+          exit 1
+        else
+          echo "╔══════════════════════════════════════╗"
+          echo "║  ✅ 第一道检查通过                   ║"
+          echo "║  所有核心功能已就绪: $TOTAL 包       ║"
+          echo "╚══════════════════════════════════════╝"
+        fi
+
+    - name: Download packages
+      run: cd openwrt && make download -j8 || make download -j1 V=s
+
+    - name: Compile firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j8 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to Artifacts
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_25_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=25-$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to Release
+      uses: softprops/action-gh-release@master
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      with:
+        token: ${{ secrets.RELEASES_TOKEN }}
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
