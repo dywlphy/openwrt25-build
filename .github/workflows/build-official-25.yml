@@ -339,12 +339,6 @@ jobs:
           grep "CONFIG_PACKAGE_${pkg}=y" .config || echo "  $pkg 未启用"
           grep "CONFIG_PACKAGE_lib${pkg}=y" .config || echo "  ⚠️ lib${pkg} 未启用"
         done
-    - name: Pre-compile cups only
-      run: |
-        cd openwrt
-        echo "预编译 cups..."
-        make package/feeds/smpackage/cups/compile -j1
-        make package/feeds/smpackage/cups/install
     - name: Download packages
       run: cd openwrt && make download -j8 || make download -j1 V=s
     - name: Compile OpenWRT firmware
