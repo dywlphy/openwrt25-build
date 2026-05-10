@@ -240,6 +240,15 @@ jobs:
         # enable_pkg "foomatic-db"
         # enable_pkg "foomatic-db-engine"
         enable_pkg "openprinting-cups-filters"
+        
+        echo ""
+        echo "【修复 ip 包冲突】"
+        # 禁用 ip-tiny，避免与 ip-full 冲突
+        sed -i 's/^CONFIG_PACKAGE_ip-tiny=y/# CONFIG_PACKAGE_ip-tiny is not set/' .config
+        # 确保 ip-full 启用
+        enable_pkg "ip-full"
+        echo "  ✅ 已禁用 ip-tiny，启用 ip-full"
+        
         sed -i 's/^CONFIG_PACKAGE_mosdns=y/# CONFIG_PACKAGE_mosdns is not set/' .config
         sed -i 's/^CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_MosDNS=y/# CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_MosDNS is not set/' .config
         sed -i 's/CONFIG_GRUB_TIMEOUT=.*/CONFIG_GRUB_TIMEOUT=0/' .config
