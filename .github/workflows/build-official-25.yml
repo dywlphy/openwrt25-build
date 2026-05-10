@@ -377,6 +377,10 @@ jobs:
           grep "CONFIG_PACKAGE_${pkg}=y" .config || echo "  $pkg 未启用"
           grep "CONFIG_PACKAGE_lib${pkg}=y" .config || echo "  ⚠️ lib${pkg} 未启用"
         done
+    - name: Resolve all dependencies
+      run: |
+        cd openwrt
+        make defconfig
     - name: Download packages
       run: cd openwrt && make download -j8 || make download -j1 V=s
     - name: Compile OpenWRT firmware
